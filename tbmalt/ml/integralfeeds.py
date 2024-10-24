@@ -40,7 +40,7 @@ def indices(dims, dtype=None, device=None):
     return res.to(device=device)
 
 
-class IntegralFeed(ABC, Feed):
+class IntegralFeed(Feed):
     r"""ABC for Hamiltonian and overlap matrix constructors.
 
     Subclasses of this abstract base class are responsible for constructing
@@ -53,6 +53,7 @@ class IntegralFeed(ABC, Feed):
     """
 
     def __init__(self, dtype, device):
+        super().__init__()
         # These variables must NEVER be modified outside the .to method!
         self.__device = device
         self.__dtype = dtype
@@ -316,12 +317,6 @@ class IntegralFeed(ABC, Feed):
         """
 
         is_batch = atomic_idx_1.ndim == 2
-
-        if isinstance(atomic_idx_1, Array):
-            import warnings
-            warnings.warn("Do no use numpy arrays here @IntegralFeed.atomic_block_indices")
-            atomic_idx_1 = torch.tensor(atomic_idx_1)
-            atomic_idx_2 = torch.tensor(atomic_idx_2)
 
         # Block indices are mostly used in their transposed form
         idx_i, idx_j = bT(atomic_idx_1), bT(atomic_idx_2)

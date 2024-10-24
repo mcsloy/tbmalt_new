@@ -6,9 +6,11 @@ from typing import List
 import numpy as np
 from ase.build import molecule
 
-from tbmalt.physics.dftb.feeds import ScipySkFeed, SkFeed, SkfOccupationFeed, HubbardFeed
+from tbmalt.physics.dftb.feeds import (
+    ScipySkFeed, SkFeed, SkVcrFeed, SkfOccupationFeed, HubbardFeed)
 from tbmalt import Geometry, OrbitalInfo
 from tbmalt.common.batch import pack
+from tbmalt.common.maths.interpolation import CubicSpline, PolyInterpU
 from functools import reduce
 
 torch.set_default_dtype(torch.float64)
@@ -145,8 +147,122 @@ def test_scipyskfeed_batch(device, skf_file: str):
 # Note that gradient tests are not performed on the ScipySkFeed as it is not
 # backpropagatable due to its use of Scipy splines for interpolation.
 
+
+def test_skfeed_poly_single(device, skf_file: str):
+    """ScipySkFeed matrix single system operability tolerance test"""
+
+    if device.type == "cuda":
+        pytest.skip("Scipy splines do not support CUDA.")
+
+    b_def = {1: [0], 6: [0, 1], 16: [0, 1, 2], 79: [0, 1, 2]}
+    H_feed = SkFeed.from_database(
+        skf_file, [1, 6, 16, 79], 'hamiltonian', PolyInterpU, device=device)
+    S_feed = SkFeed.from_database(
+        skf_file, [1, 6, 16, 79], 'overlap', PolyInterpU, device=device)
+
+    for mol, H_ref, S_ref in zip(
+            molecules(device), hamiltonians(device), overlaps(device)):
+        H = H_feed.matrix(mol, OrbitalInfo(mol.atomic_numbers, b_def))
+        S = S_feed.matrix(mol, OrbitalInfo(mol.atomic_numbers, b_def))
+
+        check_1 = torch.allclose(H, H_ref, atol=1E-7)
+        check_2 = torch.allclose(S, S_ref, atol=1E-7)
+        check_3 = H.device == device
+
+        assert check_1, f'ScipySkFeed H matrix outside of tolerance ({mol})'
+        assert check_2, f'ScipySkFeed S matrix outside of tolerance ({mol})'
+        assert check_3, 'ScipySkFeed.matrix returned on incorrect device'
+
+
+def test_skfeed_poly_batch(device, skf_file: str):
+    """ScipySkFeed matrix batch operability tolerance test"""
+
+    if device.type == "cuda":
+        pytest.skip("Scipy splines do not support CUDA.")
+
+    H_feed = SkFeed.from_database(
+        skf_file, [1, 6, 16, 79], 'hamiltonian', PolyInterpU, device=device)
+    S_feed = SkFeed.from_database(
+        skf_file, [1, 6, 16, 79], 'overlap', PolyInterpU, device=device)
+
+    mols = reduce(lambda i, j: i+j, molecules(device))
+    orbs = OrbitalInfo(mols.atomic_numbers,
+                        {1: [0], 6: [0, 1], 16: [0, 1, 2], 79: [0, 1, 2]})
+
+    H = H_feed.matrix(mols, orbs)
+    S = S_feed.matrix(mols, orbs)
+
+    check_1 = torch.allclose(H, pack(hamiltonians(device)), atol=1E-7)
+    check_2 = torch.allclose(S, pack(overlaps(device)), atol=1E-7)
+    check_3 = H.device == device
+
+    # Check that batches of size one do not cause problems
+    check_4 = (H_feed.matrix(mols[0:1], orbs[0:1]).ndim == 3)
+
+    assert check_1, 'ScipySkFeed H matrix outside of tolerance (batch)'
+    assert check_2, 'ScipySkFeed S matrix outside of tolerance (batch)'
+    assert check_3, 'ScipySkFeed.matrix returned on incorrect device'
+    assert check_4, 'Failure to operate on batches of size "one"'
+
+def test_skfeed_cubic_single(device, skf_file: str):
+    """ScipySkFeed matrix single system operability tolerance test"""
+
+    if device.type == "cuda":
+        pytest.skip("Scipy splines do not support CUDA.")
+
+    b_def = {1: [0], 6: [0, 1], 16: [0, 1, 2], 79: [0, 1, 2]}
+    H_feed = SkFeed.from_database(
+        skf_file, [1, 6, 16, 79], 'hamiltonian', CubicSpline, device=device)
+    S_feed = SkFeed.from_database(
+        skf_file, [1, 6, 16, 79], 'overlap', CubicSpline, device=device)
+
+    for mol, H_ref, S_ref in zip(
+            molecules(device), hamiltonians(device), overlaps(device)):
+        H = H_feed.matrix(mol, OrbitalInfo(mol.atomic_numbers, b_def))
+        S = S_feed.matrix(mol, OrbitalInfo(mol.atomic_numbers, b_def))
+
+        check_1 = torch.allclose(H, H_ref, atol=1E-7)
+        check_2 = torch.allclose(S, S_ref, atol=1E-7)
+        check_3 = H.device == device
+
+        assert check_1, f'ScipySkFeed H matrix outside of tolerance ({mol})'
+        assert check_2, f'ScipySkFeed S matrix outside of tolerance ({mol})'
+        assert check_3, 'ScipySkFeed.matrix returned on incorrect device'
+
+
+def test_skfeed_cubic_batch(device, skf_file: str):
+    """ScipySkFeed matrix batch operability tolerance test"""
+
+    if device.type == "cuda":
+        pytest.skip("Scipy splines do not support CUDA.")
+
+    H_feed = SkFeed.from_database(
+        skf_file, [1, 6, 16, 79], 'hamiltonian', CubicSpline, device=device)
+    S_feed = SkFeed.from_database(
+        skf_file, [1, 6, 16, 79], 'overlap', CubicSpline, device=device)
+
+    mols = reduce(lambda i, j: i+j, molecules(device))
+    orbs = OrbitalInfo(mols.atomic_numbers,
+                        {1: [0], 6: [0, 1], 16: [0, 1, 2], 79: [0, 1, 2]})
+
+    H = H_feed.matrix(mols, orbs)
+    S = S_feed.matrix(mols, orbs)
+
+    check_1 = torch.allclose(H, pack(hamiltonians(device)), atol=1E-7)
+    check_2 = torch.allclose(S, pack(overlaps(device)), atol=1E-7)
+    check_3 = H.device == device
+
+    # Check that batches of size one do not cause problems
+    check_4 = (H_feed.matrix(mols[0:1], orbs[0:1]).ndim == 3)
+
+    assert check_1, 'ScipySkFeed H matrix outside of tolerance (batch)'
+    assert check_2, 'ScipySkFeed S matrix outside of tolerance (batch)'
+    assert check_3, 'ScipySkFeed.matrix returned on incorrect device'
+    assert check_4, 'Failure to operate on batches of size "one"'
+
+
 #########################################
-# tbmalt.physics.dftb.feeds.SkFeed #
+#   tbmalt.physics.dftb.feeds.SkFeed    #
 #########################################
 # Hamiltonian and overlap data for CH4 and H2O
 def reference_data(device):
@@ -237,7 +353,7 @@ def reference_data(device):
     return H_ref_ch4, S_ref_ch4, H_ref_h2o, S_ref_h2o
 
 
-def test_skfeed_single(device, skf_file_vcr):
+def test_skvrcfeed_single(device, skf_file_vcr):
     """SkFeed matrix single system operability tolerance test"""
 
     H_ref_ch4, S_ref_ch4, H_ref_h2o, S_ref_h2o = reference_data(device)
@@ -246,10 +362,10 @@ def test_skfeed_single(device, skf_file_vcr):
     b_def = {1: [0], 6: [0, 1], 7: [0, 1], 8: [0, 1]}
 
     # Load the Hamiltonian, overlap feed model
-    h_feed = SkFeed.from_database(skf_file_vcr, species, 'hamiltonian',
-                                  interpolation='bicubic', device=device)
-    s_feed = SkFeed.from_database(skf_file_vcr, species, 'overlap',
-                                  interpolation='bicubic', device=device)
+    h_feed = SkVcrFeed.from_database(
+        skf_file_vcr, species, 'hamiltonian', device=device)
+    s_feed = SkVcrFeed.from_database(
+        skf_file_vcr, species, 'overlap', device=device)
 
     # Define (wave-function) compression radii, keep s and p the same
     vcrs = [torch.tensor([2.7, 2.5, 2.5, 2.5, 2.5], device=device),
@@ -276,7 +392,7 @@ def test_skfeed_single(device, skf_file_vcr):
 
 
 # Batch
-def test_skfeed_batch(device, skf_file_vcr):
+def test_skvcrfeed_batch(device, skf_file_vcr):
     """SkFeed matrix batch system operability tolerance test"""
 
     H_ref_ch4, S_ref_ch4, H_ref_h2o, S_ref_h2o = reference_data(device)
@@ -286,10 +402,10 @@ def test_skfeed_batch(device, skf_file_vcr):
     b_def = {1: [0], 6: [0, 1], 7: [0, 1], 8: [0, 1]}
 
     # Load the Hamiltonian, overlap feed model
-    h_feed = SkFeed.from_database(skf_file_vcr, species, 'hamiltonian',
-                                  interpolation='bicubic', device=device)
-    s_feed = SkFeed.from_database(skf_file_vcr, species, 'overlap',
-                                  interpolation='bicubic', device=device)
+    h_feed = SkVcrFeed.from_database(
+        skf_file_vcr, species, 'hamiltonian', device=device)
+    s_feed = SkVcrFeed.from_database(
+        skf_file_vcr, species, 'overlap', device=device)
 
     # Define (wave-function) compression radii, keep s and p the same
     vcrs = torch.tensor([[2.7, 2.5, 2.5, 2.5, 2.5], [2.3, 2.5, 2.5, 0, 0]],
@@ -402,7 +518,7 @@ def test_skfoccupationfeed_batch(device, skf_file):
 
 
 ###############################################
-# tbmalt.physics.dftb.feeds.HubbardFeed #
+#    tbmalt.physics.dftb.feeds.HubbardFeed    #
 ###############################################
 # General
 def test_hubbardfeed_general(device, skf_file):
@@ -488,3 +604,21 @@ def test_hubbardfeed_batch(device, skf_file):
     check_2 = torch.allclose(predicted, reference)
     assert check_2, 'Predicted hubbard value errors exceed allowed tolerance'
 
+
+if __name__ == '__main__':
+    from os import remove
+    from os.path import isfile
+
+
+    target = "/home/ajmhpc/Projects/TBMaLT/Working/Clean/tbmalt_new/example_dftb_vcr.h5"
+    if isfile(target):
+        remove(target)
+
+    torch.set_default_dtype(torch.float64)
+    device = torch.device("cpu")
+    skf_file_path = "/home/ajmhpc/Projects/TBMaLT/Working/FeedUpdating/tbmalt_new/auorg.hdf5"
+
+
+    test_skfeed_poly_single(device, skf_file_path)
+    # test_skfeed_batch(device)
+    # test_skfeed_single(device)

@@ -6,10 +6,13 @@ responsible for generating the Slater-Koster integrals and for constructing
 the associated Hamiltonian and overlap matrices.
 """
 import numpy as np
+from numpy import ndarray as Array
 from itertools import combinations_with_replacement
-from typing import List, Literal, Optional, Dict, Tuple, Union
-from scipy.interpolate import CubicSpline
+from typing import List, Literal, Optional, Dict, Tuple, Union, Iterator, Callable
+from scipy.interpolate import CubicSpline as ScipyCubicSpline
 import torch
+from torch import Tensor
+from torch.nn import Parameter
 
 from tbmalt import Geometry, OrbitalInfo, Periodicity
 from tbmalt.ml.integralfeeds import IntegralFeed
@@ -18,16 +21,14 @@ from tbmalt.physics.dftb.slaterkoster import sub_block_rot
 from tbmalt.data.elements import chemical_symbols
 from tbmalt.ml import Feed
 from tbmalt.common.batch import pack, prepeat_interleave, bT, bT2
-from tbmalt.common.maths.interpolation import PolyInterpU, BicubInterp
-from tbmalt.common.maths.interpolation import CubicSpline as CSpline
+from tbmalt.common.maths.interpolation import PolyInterpU, BicubInterp, CubicSpline
 from tbmalt.common import unique
+
 
 # Todo:
 #   - Need to determine why this is so slow for periodic systems.
 
-Tensor = torch.Tensor
-Array = np.ndarray
-interp_dict = {'polynomial': PolyInterpU, 'spline': CSpline,
+interp_dict = {'polynomial': PolyInterpU, 'spline': CubicSpline,
                'bicubic': BicubInterp}
 
 
@@ -58,7 +59,7 @@ class ScipySkFeed(IntegralFeed):
         return a single value for the σ interaction whereas a d-d interaction
         should return three values when interpolated (σ,π & δ).
 
-        Furthermore it is critical that no duplicate interactions are present.
+        Furthermore, it is critical that no duplicate interactions are present.
         That is to say if there is a (1, 6, 0, 0) (H[s]-C[s]) key present then
         there must not also be a (6, 1, 0, 0) (H[s]-C[s]) key present as they
         are the same interaction. To help prevent this the class will raise an
@@ -77,7 +78,7 @@ class ScipySkFeed(IntegralFeed):
     """
 
     def __init__(self, on_sites: Dict[int, Tensor],
-                 off_sites: Dict[Tuple[int, int, int, int], CubicSpline],
+                 off_sites: Dict[Tuple[int, int, int, int], ScipyCubicSpline],
                  dtype: Optional[torch.dtype] = None,
                  device: Optional[torch.device] = None):
 
@@ -462,6 +463,7 @@ class ScipySkFeed(IntegralFeed):
         # integrals are split over the two Slater-Koster tables, thus both must
         # be loaded.
 
+        # There must be something better than this
         def clip(x, y):
             # Removes leading zeros from the sk data which may cause errors
             # when fitting the CubicSpline.
@@ -486,7 +488,7 @@ class ScipySkFeed(IntegralFeed):
             skf = Skf.read(path, pair, device=device)
             # Loop over the off-site interactions & construct the splines.
             for key, value in skf.__getattribute__(target).items():
-                off_sites[pair + key] = CubicSpline(
+                off_sites[pair + key] = ScipyCubicSpline(
                     *clip(skf.grid, value), extrapolate=False)
 
             # The X-Y.skf file may not contain all information. Thus some info
@@ -495,7 +497,7 @@ class ScipySkFeed(IntegralFeed):
                 skf_2 = Skf.read(path, tuple(reversed(pair)), device=device)
                 for key, value in skf_2.__getattribute__(target).items():
                     if key[0] < key[1]:
-                        off_sites[pair + (*reversed(key),)] = CubicSpline(
+                        off_sites[pair + (*reversed(key),)] = ScipyCubicSpline(
                             *clip(skf_2.grid, value), extrapolate=False)
 
             else:  # Construct the onsite interactions
@@ -535,12 +537,8 @@ class SkFeed(IntegralFeed):
             the interactions, & valued by Scipy `CubicSpline` entities. Note
             that z₁ must be less than or equal to z₂, see the notes section
             for further information.
-        interpolation: interpolation type.
         device: Device on which the feed object and its contents resides.
         dtype: dtype used by feed object.
-        vcr: Compression radii in DFTB orbs.
-        is_local_onsite: `is_local_onsite` allows for constructing chemical
-            environment dependent on-site energies.
 
     Notes:
         The splines contained within the ``off_sites`` argument must return
@@ -555,16 +553,17 @@ class SkFeed(IntegralFeed):
         error if the second atomic number is greater than the first; e.g. the
         key (6, 1, 0, 0) will raise an error but (1, 6, 0, 0) will not.
 
-    Warnings:
-        `CubicSpline` instances should not attempt to extrapolate, but rather
-        return NaNs, i.e. 'extrapolate=False'. When interpolating `SkFeed`
-        instances will identify and set all NaNs to zero.
-
+    Todo:
+        - Non-pytorch based splines should issue a warning when used here.
+        - This class should be split into two classes a variable compression
+            radius version (VCR) and a non-VCR version.
+        - Code duplications within this class and between this class and
+            the scipy spline version should be minimised.
+        - The `interpolation` type should be removed from the argument.
     """
 
-    def __init__(self, on_sites: Dict[int, Tensor],
-                 off_sites: Dict[Tuple[int, int, int, int], CubicSpline],
-                 interpolation: Literal[CSpline, PolyInterpU, BicubInterp],
+    def __init__(self, on_sites: Dict[int, Union[Parameter, Tensor]],
+                 off_sites: Dict[Tuple[int, int, int, int], Union[CubicSpline, PolyInterpU]],
                  dtype: Optional[torch.dtype] = None,
                  device: Optional[torch.device] = None):
 
@@ -581,14 +580,41 @@ class SkFeed(IntegralFeed):
         super().__init__(temp.dtype if dtype is None else dtype,
                          temp.device if device is None else device)
 
-        self.on_sites = on_sites
+        # Internal occupancy values `_on_sites` values are set via its property
+        # setter rather than within the `__init__` method so that all of the
+        # necessary safety checks are performed. ──────┐
+        self._on_sites: Dict[int, Parameter] = None  # │
+        self.on_sites = on_sites  # <──────────────────┘
+
         self.off_sites = off_sites
-        self.interpolation = interpolation
 
-        self._vcr = None
-        self.is_local_onsite = False
+    @property
+    def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+        params = [i for i in self.on_sites.values()]
+        if recurse:
+            for spline in self.off_sites.values():
+                params.extend(spline.parameters())
+        return (i for i in params)
 
-    def _off_site_blocks(self, atomic_idx_1: Array, atomic_idx_2: Array,
+    @property
+    def on_sites(self) -> Dict[int, Parameter]:
+        """Dictionary of on-site values."""
+        return self._on_sites
+
+    @on_sites.setter
+    def on_sites(self, value: Dict[int, Union[Parameter, Tensor]]):
+
+        # Detach local copy so that changes made do not pollute the user's data
+        value = value.copy()
+
+        # Ensure values in the dictionary are torch `Parameter` entities.
+        for k, v in value.items():
+            if not isinstance(v, Parameter):
+                value[k] = Parameter(v, requires_grad=v.requires_grad)
+
+        self._on_sites = value
+
+    def _off_site_blocks(self, atomic_idx_1: Tensor, atomic_idx_2: Tensor,
                          geometry: Geometry, orbs: OrbitalInfo, **kwargs) -> Tensor:
         """Compute atomic interaction blocks (off-site only).
 
@@ -604,6 +630,10 @@ class SkFeed(IntegralFeed):
               orbs: Orbital information associated with said systems.
           Returns:
               blocks: Requested atomic interaction sub-blocks.
+
+        Todo: This needs to be modified to ensure that it is agnostic with
+            respect to the type of spline. It should never know the identity
+            of the spline being used to perform the interpolation.
         """
         # Identify atomic numbers associated with the interaction
         z_1 = int(geometry.atomic_numbers[*bT(atomic_idx_1[0: 1])])
@@ -617,10 +647,6 @@ class SkFeed(IntegralFeed):
                     - geometry.positions[*bT2(atomic_idx_1)])
         dist = torch.linalg.norm(dist_vec, dim=-1)
         u_vec = (dist_vec.T / dist).T
-
-        # `BicubInterp` interpolation works for VCR
-        if self.interpolation is BicubInterp:
-            cr = torch.stack([self.vcr[*bT2(atomic_idx_1)], self.vcr[*bT2(atomic_idx_2)]]).T
 
         # Work out the width of each sub-block then use it to get the row and
         # column index slicers for placing sub-blocks into their atom-blocks.
@@ -641,10 +667,7 @@ class SkFeed(IntegralFeed):
             for j, l_2 in enumerate(shells_2[o:], start=o):
                 # Retrieve/interpolate the integral spline, remove any NaNs
                 # due to extrapolation then convert to a torch tensor.
-                if self.interpolation is BicubInterp:
-                    inte = self.off_sites[(z_1, z_2, i, j)](cr, dist)
-                else:
-                    inte = self.off_sites[(z_1, z_2, i, j)](dist)
+                inte = self.off_sites[(z_1, z_2, i, j)](dist)
 
                 # Apply the Slater-Koster transformation
                 inte = sub_block_rot(torch.tensor([l_1, l_2]), u_vec, inte)
@@ -843,11 +866,7 @@ class SkFeed(IntegralFeed):
 
         # Construct the on-site blocks (if any are present)
         if any(on_site):
-            if not self.is_local_onsite:
-                blks[on_site] = torch.diag(self.on_sites[int(z_1)][mask_shell])
-            elif self.is_local_onsite:
-                blks[on_site] = torch.diag_embed(
-                    self.on_sites[int(z_1)][mask_shell], dim1=-2, dim2=-1)
+            blks[on_site] = torch.diag(self.on_sites[int(z_1)][mask_shell])
 
             # Interactions between images need to be considered for on-site
             # blocks with pbc.
@@ -876,7 +895,7 @@ class SkFeed(IntegralFeed):
     def from_database(
             cls, path: str, species: List[int],
             target: Literal['hamiltonian', 'overlap'],
-            interpolation: str = 'polynomial',
+            interpolation: Callable = PolyInterpU,
             requires_grad: bool = False,
             dtype: Optional[torch.dtype] = None,
             device: Optional[torch.device] = None) -> 'SkFeed':
@@ -890,7 +909,13 @@ class SkFeed(IntegralFeed):
             species: Integrals will only be loaded for the requested species.
             target: Specifies which integrals should be loaded options are
                 "hamiltonian" and "overlap".
-            interpolation: Define interpolation type.
+            interpolation: The `Feed` derived class that should be used to
+                interpolate the off-site Slater-Koster parameters. This may
+                be `CubicSpline`, `PolyInterpU` or any other `Feed` derived
+                class that can perform univarient interpolation. If this is
+                not manually specified then it will default to `PolyInterpU`
+                which is a PyTorch implimentation of the interpolation method
+                used in DFTB+. [DEFAULT=`PolyInterpU`]
             device: Device on which the feed object and its contents resides.
             dtype: dtype used by feed object.
 
@@ -962,11 +987,23 @@ class SkFeed(IntegralFeed):
         # integrals are split over the two Slater-Koster tables, thus both must
         # be loaded.
 
-        def clip(x, y):
-            # Removes leading zeros from the sk data which may cause errors
-            # when fitting the CubicSpline.
-            start = torch.nonzero(y.sum(0), as_tuple=True)[0][0]
-            return x[start:], y[:, start:].transpose(0, 1)
+        def construct_interpolator(
+                grid, interaction_value, interpolation_type,
+                grad, **extra_kwargs):
+            # Clip the knot values so that any leading zeros are removed from
+            # the Slater-Koster data. This is done to prevent some issues that
+            # results from fitting splines to the knots with leading zeros.
+            start = torch.nonzero(interaction_value.sum(0), as_tuple=True)[0][0]
+            grid = grid[start:]
+            interaction_value = interaction_value[:, start:].transpose(0, 1)
+
+            # Convert the y-knot values to a `torch.nn.Parameter`
+            # enable gradient tracking as required.
+            interaction_value = Parameter(
+                interaction_value, requires_grad=grad)
+
+            # Finally construct and return the interpolator
+            return interpolation_type(grid, interaction_value, **extra_kwargs)
 
         # Ensure a valid target is selected
         if target not in ['hamiltonian', 'overlap']:
@@ -974,49 +1011,393 @@ class SkFeed(IntegralFeed):
                        'options are "hamiltonian" or "overlap"')
 
         on_sites, off_sites = {}, {}
-        interpolation = interp_dict[interpolation]
-        params = {'extrapolate': False} if interpolation is CubicSpline else {}
+        params = {'extrapolate': False} if interpolation is ScipyCubicSpline else {}
 
         # The species list must be sorted to ensure that the lowest atomic
         # number comes first in the species pair.
         for pair in combinations_with_replacement(sorted(species), 2):
 
-            skf = Skf.read(path, pair, device=device) if interpolation is not BicubInterp else\
-                VCRSkf.read(path, pair, device=device)
+            skf = Skf.read(path, pair, device=device, dtype=dtype)
 
             # Loop over the off-site interactions & construct the splines.
             for key, value in skf.__getattribute__(target).items():
+                off_sites[pair + key] = construct_interpolator(
+                    skf.grid, value, interpolation, requires_grad, **params)
 
-                if interpolation is BicubInterp:
-                    off_sites[pair + key] = interpolation(
-                        skf.compression_radii.to(device),
-                        value.transpose(0, 1).to(device),
-                        skf.grid.to(device), **params)
-                else:
-                    off_sites[pair + key] = interpolation(
-                        *clip(skf.grid.to(device), value.to(device)), **params)
-
-                    # Add variables for spline training
-                    if interpolation is CSpline and requires_grad:
-                        off_sites[pair + key].abcd.requires_grad_(True)
-
-            # The X-Y.skf file may not contain all information. Thus some info
+            # The X-Y.skf file may not contain all information. Thus, some info
             # must be loaded from its Y-X counterpart.
             if pair[0] != pair[1]:
                 skf_2 = Skf.read(path, tuple(reversed(pair)))
                 for key, value in skf_2.__getattribute__(target).items():
                     if key[0] < key[1]:
-                        off_sites[pair + (*reversed(key),)] = interpolation(
-                            *clip(skf_2.grid.to(device), value.to(device)), **params)
+                        off_sites[pair + (*reversed(key),)] = construct_interpolator(
+                            skf_2.grid, value, interpolation, requires_grad, **params)
 
-                        # Add variables for spline training
-                        if interpolation is CSpline and requires_grad:
-                            off_sites[pair + (*reversed(key),)
-                                      ].abcd.requires_grad_(True)
+            else:  # Construct the onsite interactions
+                # Repeated so there's 1 value per orbital not just per shell.
+                on_sites_vals = skf.on_sites.repeat_interleave(
+                    torch.arange(len(skf.on_sites), device=device) * 2 + 1)
 
-                # Add variables for spline training
-                if interpolation is CSpline and requires_grad:
-                    off_sites[pair + key].abcd.requires_grad_(True)
+                if target == 'overlap':  # use an identity matrix for S
+                    on_sites_vals = torch.ones_like(on_sites_vals, dtype=dtype, device=device)
+
+                on_sites[pair[0]] = on_sites_vals
+
+        return cls(on_sites, off_sites, dtype, device)
+
+    def __str__(self):
+        elements = ', '.join([
+            chemical_symbols[i]for i in sorted(self.on_sites.keys())])
+        return f'{self.__class__.__name__}({elements})'
+
+    def __repr__(self):
+        return str(self)
+
+
+class SkVcrFeed(IntegralFeed):
+    r"""Slater-Koster based integral feed for DFTB calculations.
+
+    This feed uses polynomial/cubic spline/bicubic interpolation & Slater-Koster
+    transformations to construct Hamiltonian and overlap matrices via the
+    traditional DFTB method.
+
+    Arguments:
+        on_sites: On-site integrals presented as a dictionary keyed by atomic
+            numbers & valued by a tensor specifying all of associated the on-
+            site integrals; i.e. one for each orbital.
+        off_sites: Off-site integrals; dictionary keyed by tuples of the form
+            (z₁, z₂, s₁, s₂), where zᵢ & sᵢ are the atomic & shell numbers of
+            the interactions, & valued by Scipy `CubicSpline` entities. Note
+            that z₁ must be less than or equal to z₂, see the notes section
+            for further information.
+        device: Device on which the feed object and its contents resides.
+        dtype: dtype used by feed object.
+        vcr: Compression radii in DFTB orbs.
+        is_local_onsite: `is_local_onsite` allows for constructing chemical
+            environment dependent on-site energies.
+
+    Notes:
+        The splines contained within the ``off_sites`` argument must return
+        all relevant bond order integrals; e.g. a s-s interaction should only
+        return a single value for the σ interaction whereas a d-d interaction
+        should return three values when interpolated (σ,π & δ).
+
+        Furthermore it is critical that no duplicate interactions are present.
+        That is to say if there is a (1, 6, 0, 0) (H[s]-C[s]) key present then
+        there must not also be a (6, 1, 0, 0) (H[s]-C[s]) key present as they
+        are the same interaction. To help prevent this the class will raise an
+        error if the second atomic number is greater than the first; e.g. the
+        key (6, 1, 0, 0) will raise an error but (1, 6, 0, 0) will not.
+
+    Warnings:
+        `CubicSpline` instances should not attempt to extrapolate, but rather
+        return NaNs, i.e. 'extrapolate=False'. When interpolating `SkFeed`
+        instances will identify and set all NaNs to zero.
+
+    Todo:
+        - Non-pytorch based splines should issue a warning when used here.
+        - This class should be split into two classes a variable compression
+            radius version (VCR) and a non-VCR version.
+        - Code duplications within this class and between this class and
+            the scipy spline version should be minimised.
+        - The `interpolation` type should be removed from the argument.
+        - The `VRC` component should be manditory.
+        - What is the `is_local_onsite` entity doing? Why is it treated
+            like a boolean in some places but not others?
+        - Rewrite documentation.
+    """
+
+    def __init__(self, on_sites: Dict[int, Union[Parameter, Tensor]],
+                 off_sites: Dict[Tuple[int, int, int, int], BicubInterp],
+                 dtype: Optional[torch.dtype] = None,
+                 device: Optional[torch.device] = None):
+
+        # Ensure that the on_sites are torch tensors
+        if not isinstance(temp := list(on_sites.values())[0], Tensor):
+            on_sites = {k: torch.tensor(v, dtype=dtype, device=device)
+                        for k, v in on_sites.items()}
+
+        # Validate the off-site keys
+        if any(map(lambda k: k[0] > k[1], off_sites.keys())):
+            ValueError('Lowest Z must be given first in off_site keys')
+
+        # Pass the dtype and device to the ABC, if none are given the default
+        super().__init__(temp.dtype if dtype is None else dtype,
+                         temp.device if device is None else device)
+
+        # Internal occupancy values `_on_sites` values are set via its property
+        # setter rather than within the `__init__` method so that all of the
+        # necessary safety checks are performed. ──────┐
+        self._on_sites: Dict[int, Parameter] = None  # │
+        self.on_sites = on_sites  # <──────────────────┘
+
+        self.off_sites = off_sites
+
+        self._vcr = None
+        self.is_local_onsite = False
+
+    @property
+    def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+        params = [i for i in self.on_sites.values()]
+        if recurse:
+            for spline in self.off_sites.values():
+                params.extend(spline.parameters())
+        return (i for i in params)
+
+    @property
+    def on_sites(self) -> Dict[int, Parameter]:
+        """Dictionary of on-site values."""
+        return self._on_sites
+
+    @on_sites.setter
+    def on_sites(self, value: Dict[int, Union[Parameter, Tensor]]):
+
+        # Detach local copy so that changes made do not pollute the user's data
+        value = value.copy()
+
+        # Ensure values in the dictionary are torch `Parameter` entities.
+        for k, v in value.items():
+            if not isinstance(v, Parameter):
+                value[k] = Parameter(v, requires_grad=v.requires_grad)
+
+        self._on_sites = value
+
+    def _off_site_blocks(self, atomic_idx_1: Tensor, atomic_idx_2: Tensor,
+                         geometry: Geometry, orbs: OrbitalInfo, **kwargs) -> Tensor:
+        """Compute atomic interaction blocks (off-site only).
+
+        Constructs the off-site atomic blocks using Slater-Koster integral
+        tables.
+
+        Arguments:
+              atomic_idx_1: Indices of the 1'st atom associated with each
+                desired interaction block.
+              atomic_idx_2: Indices of the 2'nd atom associated with each
+                  desired interaction block.
+              geometry: The systems to which the atomic indices relate.
+              orbs: Orbital information associated with said systems.
+          Returns:
+              blocks: Requested atomic interaction sub-blocks.
+
+        Todo: This needs to be modified to ensure that it is agnostic with
+            respect to the type of spline. It should never know the identity
+            of the spline being used to perform the interpolation.
+        """
+        # Identify atomic numbers associated with the interaction
+        z_1 = int(geometry.atomic_numbers[*bT(atomic_idx_1[0: 1])])
+        z_2 = int(geometry.atomic_numbers[*bT(atomic_idx_2[0: 1])])
+
+        # Get the species' shell lists (basically a list of azimuthal numbers)
+        shells_1, shells_2 = orbs.shell_dict[z_1], orbs.shell_dict[z_2]
+
+        # Inter-atomic distance and distance vector calculator.
+        dist_vec = (geometry.positions[*bT2(atomic_idx_2)]
+                    - geometry.positions[*bT2(atomic_idx_1)])
+        dist = torch.linalg.norm(dist_vec, dim=-1)
+        u_vec = (dist_vec.T / dist).T
+
+        # `BicubInterp` interpolation works for VCR
+        compression_radius = torch.stack([self.vcr[*bT2(atomic_idx_1)], self.vcr[*bT2(atomic_idx_2)]]).T
+
+        # Work out the width of each sub-block then use it to get the row and
+        # column index slicers for placing sub-blocks into their atom-blocks.
+        rws, cws = np.array(shells_1) * 2 + 1, np.array(shells_2) * 2 + 1
+        rows = [slice(i - j, i) for i, j in zip(rws.cumsum(), rws)]
+        cols = [slice(i - j, i) for i, j in zip(cws.cumsum(), cws)]
+
+        # Tensor to hold the resulting atomic-blocks.
+        blks = torch.zeros(atomic_idx_1.shape[0], rws.sum(), cws.sum(),
+                           dtype=self.dtype, device=self.device)
+
+        # Loop over the 1st species' shells; where i & l_1 are the shell's index
+        # & azimuthal numbers respectively. Then over the 2nd species' shells,
+        # but ignore sub-blocks in the lower triangle of homo-atomic blocks as
+        # they can be constructed via symmetrisation.
+        for i, l_1 in enumerate(shells_1):
+            o = i if z_1 == z_2 else 0
+            for j, l_2 in enumerate(shells_2[o:], start=o):
+                # Retrieve/interpolate the integral spline, remove any NaNs
+                # due to extrapolation then convert to a torch tensor.
+                inte = self.off_sites[(z_1, z_2, i, j)](compression_radius, dist)
+
+                # Apply the Slater-Koster transformation
+                inte = sub_block_rot(torch.tensor([l_1, l_2]), u_vec, inte)
+
+                # Add the sub-blocks into their associated atom-blocks
+                blks[:, rows[i], cols[j]] = inte
+
+                # Add symmetrically equivalent sub-blocks (homo-atomic only)
+                if z_1 == z_2 and i != j:
+                    sign = (-1) ** (l_1 + l_2)
+                    blks.transpose(-1, -2)[:, rows[i], cols[j]] = inte * sign
+
+        return blks
+
+    def _pe_blocks(self, atomic_idx_1: Tensor, atomic_idx_2: Tensor,
+                   geometry: Geometry, orbs: OrbitalInfo,
+                   periodic: Periodicity, **kwargs) -> Tensor:
+        raise NotImplementedError(
+            "The variable compression_radius Slater-Koster feed does not"
+            " currently support periodic systems")
+
+    def blocks(self, atomic_idx_1: Tensor, atomic_idx_2: Tensor,
+               geometry: Geometry, orbs: OrbitalInfo, **kwargs) -> Tensor:
+        r"""Compute atomic interaction blocks using SK-integral tables.
+
+        Returns the atomic blocks associated with the atoms in ``atomic_idx_1``
+        interacting with those in ``atomic_idx_2`` splines and Slater-Koster
+        transformations. This is the base method used in DFTB calculations.
+        Note that The № of interaction blocks returned will be equal to the
+        length of the two index lists; i.e. *not* one for every combination.
+
+        Arguments:
+            atomic_idx_1: Indices of the 1'st atom associated with each
+                desired interaction block.
+            atomic_idx_2: Indices of the 2'nd atom associated with each
+                desired interaction block.
+            geometry: The systems to which the atomic indices relate.
+            orbs: Orbital information associated with said systems.
+
+        Returns:
+            blocks: Requested atomic interaction sub-blocks.
+
+        """
+        # Get the atomic numbers of the atoms
+        zs = geometry.atomic_numbers
+        zs_1 = zs[*bT2(atomic_idx_1)]
+        zs_2 = zs[*bT2(atomic_idx_2)]
+
+        # Ensure all interactions are between identical species pairs.
+        if len(zs_1.unique()) != 1:
+            raise ValueError('Atoms in atomic_idx_1 must be the same species')
+
+        if len(zs_2.unique()) != 1:
+            raise ValueError('Atoms in atomic_idx_2 must be the same species')
+
+        # Atomic numbers of the species in list 1 and 2
+        z_1, z_2 = zs_1[0], zs_2[0]
+
+        # C-N and N-C are the same interaction: choice has been made to have
+        # only one set of splines for each species pair. Thus, the two lists
+        # may need to be swapped.
+        if z_1 > z_2:
+            atomic_idx_1, atomic_idx_2 = atomic_idx_2, atomic_idx_1
+            z_1, z_2 = z_2, z_1
+            flip = True
+        else:
+            flip = False
+
+        # Construct the tensor into which results are to be placed
+        n_rows, n_cols = orbs.n_orbs_on_species(torch.stack((z_1, z_2)))
+        blks = torch.zeros(len(atomic_idx_1), n_rows, n_cols, dtype=self.dtype,
+                           device=self.device)
+
+        # Identify which are on-site blocks and which are off-site
+        on_site = self._partition_blocks(atomic_idx_1, atomic_idx_2)
+        mask_shell = torch.zeros_like(self.on_sites[int(z_1)]).bool()
+        mask_shell[:(torch.arange(len(orbs.shell_dict[int(z_1)]))
+                     * 2 + 1).sum()] = True
+
+        # Construct the on-site blocks (if any are present)
+        if any(on_site):
+            if not self.is_local_onsite:
+                blks[on_site] = torch.diag(self.on_sites[int(z_1)][mask_shell])
+            elif self.is_local_onsite:
+                blks[on_site] = torch.diag_embed(
+                    self.on_sites[int(z_1)][mask_shell], dim1=-2, dim2=-1)
+
+            # Interactions between images need to be considered for on-site
+            # blocks with pbc.
+            if geometry.periodicity is not None:
+                _on_site = self._pe_blocks(
+                    atomic_idx_1[on_site], atomic_idx_2[on_site],
+                    geometry, orbs, geometry.periodicity, onsite=True)
+                blks[on_site] = blks[on_site] + _on_site
+
+        if any(~on_site):  # Then the off-site blocks
+            if geometry.periodicity is None:
+                blks[~on_site] = self._off_site_blocks(
+                    atomic_idx_1[~on_site], atomic_idx_2[~on_site],
+                    geometry, orbs)
+            else:
+                blks[~on_site] = self._pe_blocks(
+                    atomic_idx_1[~on_site], atomic_idx_2[~on_site],
+                    geometry, orbs, geometry.periodicity)
+
+        if flip:  # If the atoms were switched, then a transpose is required.
+            blks = blks.transpose(-1, -2)
+
+        return blks
+
+    @classmethod
+    def from_database(
+            cls, path: str, species: List[int],
+            target: Literal['hamiltonian', 'overlap'],
+            requires_grad: bool = False,
+            dtype: Optional[torch.dtype] = None,
+            device: Optional[torch.device] = None) -> 'SkVcrFeed':
+        r"""Instantiate instance from an HDF5 database of Slater-Koster files.
+
+        Instantiate a `SkVcrFeed` instance for the specified elements using
+        integral tables contained within a Slater-Koster HDF5 database.
+
+        Arguments:
+            path: Path to the HDF5 file from which integrals should be taken.
+            species: Integrals will only be loaded for the requested species.
+            target: Specifies which integrals should be loaded options are
+                "hamiltonian" and "overlap".
+            device: Device on which the feed object and its contents resides.
+            dtype: dtype used by feed object.
+
+        Returns:
+            sk_feed: A `SkFeed` instance with the requested integrals.
+
+        Notes:
+            This method will not instantiate `SkVcrFeed` instances directly
+            from human readable skf files, or a directory thereof. Thus, any
+            such files must first be converted into their binary equivalent.
+            This reduces overhead & file format error instabilities. The code
+            block provide below shows how this can be done:
+
+        """
+
+        if requires_grad:
+            raise NotImplementedError(
+                "The variable compression radius Slater-Koster feed does not"
+                " yet support automatic autograd activation. Please enable"
+                " manualy.")
+
+        # As C-H & C-H interactions are the same only one needs to be loaded.
+        # Thus, only off-site interactions where z₁≤z₂ are generated. However,
+        # integrals are split over the two Slater-Koster tables, thus both must
+        # be loaded.
+
+        # Ensure a valid target is selected
+        if target not in ['hamiltonian', 'overlap']:
+            ValueError('Invalid target selected; '
+                       'options are "hamiltonian" or "overlap"')
+
+        on_sites, off_sites = {}, {}
+
+        # The species list must be sorted to ensure that the lowest atomic
+        # number comes first in the species pair.
+        for pair in combinations_with_replacement(sorted(species), 2):
+
+            skf = VCRSkf.read(path, pair, device=device)
+
+            # Loop over the off-site interactions & construct the splines.
+            for key, value in skf.__getattribute__(target).items():
+                    off_sites[pair + key] = BicubInterp(
+                        skf.compression_radii.to(device), value.transpose(0, 1), skf.grid)
+
+            # The X-Y.skf file may not contain all information. Thus, some info
+            # must be loaded from its Y-X counterpart.
+            if pair[0] != pair[1]:
+                skf_2 = Skf.read(path, tuple(reversed(pair)))
+                for key, value in skf_2.__getattribute__(target).items():
+                    if key[0] < key[1]:
+                            off_sites[pair + key] = BicubInterp(
+                                skf.compression_radii.to(device), value.transpose(0, 1), skf.grid)
 
             else:  # Construct the onsite interactions
                 # Repeated so there's 1 value per orbital not just per shell.
@@ -1028,7 +1409,7 @@ class SkFeed(IntegralFeed):
 
                 on_sites[pair[0]] = on_sites_vals
 
-        return cls(on_sites, off_sites, interpolation, dtype, device)
+        return cls(on_sites, off_sites, dtype, device)
 
     @property
     def vcr(self):
@@ -1070,12 +1451,42 @@ class SkfOccupationFeed(Feed):
         Note that this method discriminates between orbitals based only on
         the azimuthal number of the orbital & the species to which it belongs.
     """
-    def __init__(self, occupancies: Dict[int, Tensor]):
+    def __init__(self, occupancies: Dict[int, Union[Tensor, Parameter]]):
         # This class will be abstracted and extended to allow for specification
         # via shell number which will avoid the current limits which only allow
         # for minimal orbs sets.
+        super().__init__()
 
-        self.occupancies = occupancies
+        # Detach local copy so that changes made do not pollute the user's data
+        occupancies = occupancies.copy()
+
+        # Internal occupancy values `_occupancies` is set via the associated
+        # property setter rather than within the `__init__` method so that all
+        # the necessary safety checks are performed. ┐
+        self._occupancies = None       #             │
+        self.occupancies = occupancies # <───────────┘
+
+    @property
+    def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+        return (i for i in self._occupancies.values())
+
+    @property
+    def occupancies(self) -> Dict[int, Parameter]:
+        """Dictionary of occupancy values."""
+        return self._occupancies
+
+    @occupancies.setter
+    def occupancies(self, value: Dict[int, Union[Parameter, Tensor]]):
+
+        # Detach local copy so that changes made do not pollute the user's data
+        value = value.copy()
+
+        # Ensure values in the dictionary are torch `Parameter` entities.
+        for k, v in value.items():
+            if not isinstance(v, Parameter):
+                value[k] = Parameter(v, requires_grad=v.requires_grad)
+
+        self._occupancies = value
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1216,12 +1627,39 @@ class HubbardFeed(Feed):
         `hubbard_u` is found to only be atom resolved; and vise versa. The skf
         database should also instruct the loader whether it is shell-resolved.
     """
-    def __init__(self, hubbard_u: Dict[int, Tensor]):
+    def __init__(self, hubbard_u: Dict[int, Union[Parameter, Tensor]]):
         # This class will be abstracted and extended to allow for specification
         # via shell number which will avoid the current limits which only allow
         # for minimal orbs sets.
+        super().__init__()
 
-        self.hubbard_u = hubbard_u
+        # The internal Hubbard-U values `_hubbard_u` is set via the associated
+        # property setter rather than within the `__init__` method so that all
+        # the necessary safety checks are performed. ┐
+        self._hubbard_u = None     #                 │
+        self.hubbard_u = hubbard_u # <───────────────┘
+
+    @property
+    def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+        return (i for i in self.hubbard_u.values())
+
+    @property
+    def hubbard_u(self) -> Dict[int, Parameter]:
+        """Dictionary of Hubbard-U values."""
+        return self._hubbard_u
+
+    @hubbard_u.setter
+    def hubbard_u(self, value: Dict[int, Union[Parameter, Tensor]]):
+
+        # Detach local copy so that changes made do not pollute the user's data
+        value = value.copy()
+
+        # Ensure values in the dictionary are torch `Parameter` entities.
+        for k, v in value.items():
+            if not isinstance(v, Parameter):
+                value[k] = Parameter(v, requires_grad=v.requires_grad)
+
+        self._hubbard_u = value
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1297,7 +1735,9 @@ class HubbardFeed(Feed):
 
         Keyword Arguments:
             device: Device on which to place tensors. [DEFAULT=None]
-            dtype: dtype to be used for floating point tensors. [DEFAULT=None]
+            dtype: Dtype to be used for floating point tensors. [DEFAULT=None]
+            requires_grad: Should the Hubbard-U values be designated as
+                optimisaiton targets? [DEFAULT=False]
 
         Returns:
             occupancy_feed: An `HubbardFeed` instance containing the
@@ -1340,17 +1780,23 @@ class HubbardFeed(Feed):
         return cls({i: Skf.read(path, (i, i), **kwargs).hubbard_us
                     for i in species})
 
-class RepulsiveSplineFeed(Feed):
-    r"""Repulsive Feed using splines for DFTB calculations. Data is derived from a skf file.
 
-    This feed uses splines to calculate the repulsive energy of a Geometry in the way it is defined for DFTB.
+class RepulsiveSplineFeed(Feed):
+    r"""Repulsive Feed using splines for DFTB calculations.
+
+    Data is derived from a skf file. This feed uses splines to calculate the
+    repulsive energy of a Geometry in the way it is defined for DFTB.
 
     Arguments:
-        spline_data: Dictionary containing the the tuples of atomic number pairs as keys and the corresponding spline data as values.
+        spline_data: Dictionary containing the tuples of atomic number pairs
+            as keys and the corresponding spline data as values.
     """
 
     def __init__(self, spline_data: Dict[Tuple, Tensor]):
-        self.spline_data = {frozenset(interaction_pairs):data for interaction_pairs,data in spline_data.items()}
+        super().__init__()
+        self.spline_data = {
+            frozenset(interaction_pairs):
+                data for interaction_pairs, data in spline_data.items()}
 
     @property
     def dtype(self) -> torch.dtype:
@@ -1366,7 +1812,9 @@ class RepulsiveSplineFeed(Feed):
         r"""Calculate the repulsive energy of a Geometry.
 
         Arguments:
-            geo: Geometry object(s) for which the repulsive energy should be calculated. Either a single Geometry object or a batch of Geometry objects.
+            geo: Geometry object(s) for which the repulsive energy should be
+                calculated. Either a single Geometry object or a batch of
+                Geometry objects.
 
         Returns:
             Erep: The repulsive energy of the Geometry object(s).
@@ -1474,7 +1922,11 @@ class RepulsiveSplineFeed(Feed):
 
 
     @classmethod
-    def from_database(cls, path: str, species: List[int], dtype: Optional[torch.dtype] = None, device: Optional[torch.device] = None) -> 'RepulsiveSplineFeed':
+    def from_database(
+            cls, path: str, species: List[int],
+            dtype: Optional[torch.dtype] = None,
+            device: Optional[torch.device] = None
+    ) -> 'RepulsiveSplineFeed':
         r"""Instantiate instance from a HDF5 database of Slater-Koster files.
 
         Instantiate a `RepulsiveSplineFeed` instance from a HDF5 database for the specified elements.
@@ -1502,3 +1954,576 @@ class RepulsiveSplineFeed(Feed):
         interaction_pairs = combinations_with_replacement(species, r=2)
         return cls({interaction_pair: Skf.read(path, interaction_pair, device=device, dtype=dtype).r_spline for interaction_pair in interaction_pairs})
 
+
+
+# class SkFeed(IntegralFeed):
+#     r"""Slater-Koster based integral feed for DFTB calculations.
+#
+#     This feed uses polynomial/cubic spline/bicubic interpolation & Slater-Koster
+#     transformations to construct Hamiltonian and overlap matrices via the
+#     traditional DFTB method.
+#
+#     Arguments:
+#         on_sites: On-site integrals presented as a dictionary keyed by atomic
+#             numbers & valued by a tensor specifying all of associated the on-
+#             site integrals; i.e. one for each orbital.
+#         off_sites: Off-site integrals; dictionary keyed by tuples of the form
+#             (z₁, z₂, s₁, s₂), where zᵢ & sᵢ are the atomic & shell numbers of
+#             the interactions, & valued by Scipy `CubicSpline` entities. Note
+#             that z₁ must be less than or equal to z₂, see the notes section
+#             for further information.
+#         interpolation: interpolation type.
+#         device: Device on which the feed object and its contents resides.
+#         dtype: dtype used by feed object.
+#         vcr: Compression radii in DFTB orbs.
+#         is_local_onsite: `is_local_onsite` allows for constructing chemical
+#             environment dependent on-site energies.
+#
+#     Notes:
+#         The splines contained within the ``off_sites`` argument must return
+#         all relevant bond order integrals; e.g. a s-s interaction should only
+#         return a single value for the σ interaction whereas a d-d interaction
+#         should return three values when interpolated (σ,π & δ).
+#
+#         Furthermore it is critical that no duplicate interactions are present.
+#         That is to say if there is a (1, 6, 0, 0) (H[s]-C[s]) key present then
+#         there must not also be a (6, 1, 0, 0) (H[s]-C[s]) key present as they
+#         are the same interaction. To help prevent this the class will raise an
+#         error if the second atomic number is greater than the first; e.g. the
+#         key (6, 1, 0, 0) will raise an error but (1, 6, 0, 0) will not.
+#
+#     Warnings:
+#         `CubicSpline` instances should not attempt to extrapolate, but rather
+#         return NaNs, i.e. 'extrapolate=False'. When interpolating `SkFeed`
+#         instances will identify and set all NaNs to zero.
+#
+#     Todo:
+#         - Non-pytorch based splines should issue a warning when used here.
+#         - This class should be split into two classes a variable compression
+#             radius version (VCR) and a non-VCR version.
+#         - Code duplications within this class and between this class and
+#             the scipy spline version should be minimised.
+#         - The `interpolation` type should be removed from the argument.
+#     """
+#
+#     def __init__(self, on_sites: Dict[int, Union[Parameter, Tensor]],
+#                  off_sites: Dict[Tuple[int, int, int, int], Literal[CubicSpline, PolyInterpU, BicubInterp]],
+#                  interpolation: Literal[CubicSpline, PolyInterpU, BicubInterp],
+#                  dtype: Optional[torch.dtype] = None,
+#                  device: Optional[torch.device] = None):
+#
+#         # Ensure that the on_sites are torch tensors
+#         if not isinstance(temp := list(on_sites.values())[0], Tensor):
+#             on_sites = {k: torch.tensor(v, dtype=dtype, device=device)
+#                         for k, v in on_sites.items()}
+#
+#         # Validate the off-site keys
+#         if any(map(lambda k: k[0] > k[1], off_sites.keys())):
+#             ValueError('Lowest Z must be given first in off_site keys')
+#
+#         # Pass the dtype and device to the ABC, if none are given the default
+#         super().__init__(temp.dtype if dtype is None else dtype,
+#                          temp.device if device is None else device)
+#
+#         # Internal occupancy values `_on_sites` values are set via its property
+#         # setter rather than within the `__init__` method so that all of the
+#         # necessary safety checks are performed. ──────┐
+#         self._on_sites: Dict[int, Parameter] = None  # │
+#         self.on_sites = on_sites  # <──────────────────┘
+#
+#         self.off_sites = off_sites
+#         self.interpolation = interpolation
+#
+#         self._vcr = None
+#         self.is_local_onsite = False
+#
+#     @property
+#     def parameters(self, recurse: bool = True) -> Iterator[Parameter]:
+#         params = [i for i in self.on_sites.values()]
+#         if recurse:
+#             for spline in self.off_sites.values():
+#                 params.extend(spline.parameters())
+#         return (i for i in params)
+#
+#     @property
+#     def on_sites(self) -> Dict[int, Parameter]:
+#         """Dictionary of on-site values."""
+#         return self._on_sites
+#
+#     @on_sites.setter
+#     def on_sites(self, value: Dict[int, Union[Parameter, Tensor]]):
+#
+#         # Detach local copy so that changes made do not pollute the user's data
+#         value = value.copy()
+#
+#         # Ensure values in the dictionary are torch `Parameter` entities.
+#         for k, v in value.items():
+#             if not isinstance(v, Parameter):
+#                 value[k] = Parameter(v, requires_grad=v.requires_grad)
+#
+#         self._on_sites = value
+#
+#     def _off_site_blocks(self, atomic_idx_1: Tensor, atomic_idx_2: Tensor,
+#                          geometry: Geometry, orbs: OrbitalInfo, **kwargs) -> Tensor:
+#         """Compute atomic interaction blocks (off-site only).
+#
+#         Constructs the off-site atomic blocks using Slater-Koster integral
+#         tables.
+#
+#         Arguments:
+#               atomic_idx_1: Indices of the 1'st atom associated with each
+#                 desired interaction block.
+#               atomic_idx_2: Indices of the 2'nd atom associated with each
+#                   desired interaction block.
+#               geometry: The systems to which the atomic indices relate.
+#               orbs: Orbital information associated with said systems.
+#           Returns:
+#               blocks: Requested atomic interaction sub-blocks.
+#
+#         Todo: This needs to be modified to ensure that it is agnostic with
+#             respect to the type of spline. It should never know the identity
+#             of the spline being used to perform the interpolation.
+#         """
+#         # Identify atomic numbers associated with the interaction
+#         z_1 = int(geometry.atomic_numbers[*bT(atomic_idx_1[0: 1])])
+#         z_2 = int(geometry.atomic_numbers[*bT(atomic_idx_2[0: 1])])
+#
+#         # Get the species' shell lists (basically a list of azimuthal numbers)
+#         shells_1, shells_2 = orbs.shell_dict[z_1], orbs.shell_dict[z_2]
+#
+#         # Inter-atomic distance and distance vector calculator.
+#         dist_vec = (geometry.positions[*bT2(atomic_idx_2)]
+#                     - geometry.positions[*bT2(atomic_idx_1)])
+#         dist = torch.linalg.norm(dist_vec, dim=-1)
+#         u_vec = (dist_vec.T / dist).T
+#
+#         # `BicubInterp` interpolation works for VCR
+#         if self.interpolation is BicubInterp:
+#             cr = torch.stack([self.vcr[*bT2(atomic_idx_1)], self.vcr[*bT2(atomic_idx_2)]]).T
+#
+#         # Work out the width of each sub-block then use it to get the row and
+#         # column index slicers for placing sub-blocks into their atom-blocks.
+#         rws, cws = np.array(shells_1) * 2 + 1, np.array(shells_2) * 2 + 1
+#         rows = [slice(i - j, i) for i, j in zip(rws.cumsum(), rws)]
+#         cols = [slice(i - j, i) for i, j in zip(cws.cumsum(), cws)]
+#
+#         # Tensor to hold the resulting atomic-blocks.
+#         blks = torch.zeros(atomic_idx_1.shape[0], rws.sum(), cws.sum(),
+#                            dtype=self.dtype, device=self.device)
+#
+#         # Loop over the 1st species' shells; where i & l_1 are the shell's index
+#         # & azimuthal numbers respectively. Then over the 2nd species' shells,
+#         # but ignore sub-blocks in the lower triangle of homo-atomic blocks as
+#         # they can be constructed via symmetrisation.
+#         for i, l_1 in enumerate(shells_1):
+#             o = i if z_1 == z_2 else 0
+#             for j, l_2 in enumerate(shells_2[o:], start=o):
+#                 # Retrieve/interpolate the integral spline, remove any NaNs
+#                 # due to extrapolation then convert to a torch tensor.
+#                 if self.interpolation is BicubInterp:
+#                     inte = self.off_sites[(z_1, z_2, i, j)](cr, dist)
+#                 else:
+#                     inte = self.off_sites[(z_1, z_2, i, j)](dist)
+#
+#                 # Apply the Slater-Koster transformation
+#                 inte = sub_block_rot(torch.tensor([l_1, l_2]), u_vec, inte)
+#
+#                 # Add the sub-blocks into their associated atom-blocks
+#                 blks[:, rows[i], cols[j]] = inte
+#
+#                 # Add symmetrically equivalent sub-blocks (homo-atomic only)
+#                 if z_1 == z_2 and i != j:
+#                     sign = (-1) ** (l_1 + l_2)
+#                     blks.transpose(-1, -2)[:, rows[i], cols[j]] = inte * sign
+#
+#         return blks
+#
+#     def _pe_blocks(self, atomic_idx_1: Tensor, atomic_idx_2: Tensor,
+#                    geometry: Geometry, orbs: OrbitalInfo,
+#                    periodic: Periodicity, **kwargs) -> Tensor:
+#         """Compute atomic interaction blocks (on-site and off-site) with pbc.
+#
+#         Constructs the on-site and off-site atomic blocks using Slater-Koster
+#         integral tables for periodicity systems.
+#
+#         Arguments:
+#               atomic_idx_1: Indices of the 1'st atom associated with each
+#                 desired interaction block.
+#               atomic_idx_2: Indices of the 2'nd atom associated with each
+#                   desired interaction block.
+#               geometry: The systems to which the atomic indices relate.
+#               orbs: Orbital information associated with said systems.
+#               periodic: Periodic object containing distance matrix and position
+#                   vectors for periodic images.
+#
+#           Returns:
+#               blocks: Requested atomic interaction sub-blocks.
+#         """
+#
+#         # Check whether on-site block
+#         onsite = kwargs.get('onsite', False)
+#
+#         # Check whether batch
+#         n_batch = (len(periodic.neighbour_vector)
+#                    if periodic.neighbour_vector.ndim == 5 else None)
+#
+#         # Identify atomic numbers associated with the interaction
+#         z_1 = int(geometry.atomic_numbers[*bT(atomic_idx_1[0: 1])])
+#         z_2 = int(geometry.atomic_numbers[*bT(atomic_idx_2[0: 1])])
+#
+#         # Get the species' shell lists (basically a list of azimuthal numbers)
+#         shells_1, shells_2 = orbs.shell_dict[z_1], orbs.shell_dict[z_2]
+#
+#         # Inter-atomic distance and distance vector calculator.
+#         if n_batch is None:  # -> single
+#             dist_vec = periodic.neighbour_vector[:, atomic_idx_1, atomic_idx_2]
+#         else:  # -> batch
+#             # Split the atomic index due to batch
+#             sys_idx, idx = unique(atomic_idx_1[:, 0], return_index=True)
+#             # Convert locations at which a split should be made into bucket
+#             # size values, as needed by PyTorch.
+#             idx = idx.diff().cpu().tolist()
+#             idx.append(atomic_idx_2.shape[-2] - sum(idx))
+#             _idx_1_split = torch.split(atomic_idx_1[:, 1], idx)
+#             _idx_2_split = torch.split(atomic_idx_2[:, 1], idx)
+#
+#             # Distance vectors are packed for batch
+#             dist_vec, mask_pack = pack([
+#                     periodic.neighbour_vector[
+#                         sys_idx[ibatch]][:, _idx_1_split[ibatch], _idx_2_split[
+#                             ibatch]]
+#                     for ibatch in range(len(sys_idx))],
+#                         value=1e3, return_mask=True)
+#
+#             # Reduce the dimension of batch
+#             dist_vec = dist_vec.flatten(-4, -3)
+#
+#             # Mask to select items before padding with correct size
+#             mask_pack = mask_pack[..., 0][:, 0]
+#
+#         # Number of images
+#         ncell = periodic.neighbour_vector.size(-4)
+#
+#         # Distance matrix
+#         dist = torch.linalg.norm(dist_vec, dim=-1)
+#
+#         # Mask for zero-distance terms in on-site block
+#         dist[dist == 0] = 99
+#
+#         # Reduce the dimension of image
+#         dist_vec = dist_vec.flatten(-3, -2)
+#         dist = dist.flatten(-2, -1)
+#         u_vec = (dist_vec.T / dist).T
+#
+#         # Work out the width of each sub-block then use it to get the row and
+#         # column index slicers for placing sub-blocks into their atom-blocks.
+#         rws, cws = np.array(shells_1) * 2 + 1, np.array(shells_2) * 2 + 1
+#         rows = [slice(i - j, i) for i, j in zip(rws.cumsum(), rws)]
+#         cols = [slice(i - j, i) for i, j in zip(cws.cumsum(), cws)]
+#
+#         # Tensor to hold the resulting atomic-blocks.
+#         blks = torch.zeros(atomic_idx_1.shape[0], rws.sum(), cws.sum(),
+#                            dtype=self.dtype, device=self.device)
+#
+#         # Loop over the 1st species' shells; where i & l_1 are the shell's index
+#         # & azimuthal numbers respectively. Then over the 2nd species' shells,
+#         # but ignore sub-blocks in the lower triangle of homo-atomic blocks as
+#         # they can be constructed via symmetrisation.
+#         for i, l_1 in enumerate(shells_1):
+#             o = i if z_1 == z_2 else 0
+#             for j, l_2 in enumerate(shells_2[o:], start=o):
+#                 # Retrieve/interpolate the integral spline, remove any NaNs
+#                 # due to extrapolation then convert to a torch tensor.
+#                 inte = self.off_sites[(z_1, z_2, i, j)](dist)
+#                 inte[inte != inte] = 0.0
+#
+#                 # Apply the Slater-Koster transformation
+#                 inte = sub_block_rot(torch.tensor([l_1, l_2]), u_vec, inte)
+#
+#                 # Reshape the integral for images and sum together
+#                 if n_batch is None:
+#                     _inte = inte.view(ncell, -1, inte.size(-2),
+#                                       inte.size(-1)).sum(-4)
+#                 else:
+#                     _inte = inte.view(len(sys_idx), ncell, -1, inte.size(-2),
+#                                       inte.size(-1)).sum(-4)[mask_pack]
+#
+#                 # 5, ncell, -1, 1, 1
+#                 # Add the sub-blocks into their associated atom-blocks
+#                 blks[:, rows[i], cols[j]] = _inte
+#
+#                 # Add symmetrically equivalent sub-blocks (homo-atomic only)
+#                 if z_1 == z_2 and i != j:
+#                     if onsite:
+#                         blks.transpose(-1, -2)[:, rows[i], cols[j]] = _inte
+#                     else:
+#                         sign = (-1) ** (l_1 + l_2)
+#                         blks.transpose(-1, -2)[:, rows[i], cols[j]] = _inte * sign
+#
+#         return blks
+#
+#     def blocks(self, atomic_idx_1: Tensor, atomic_idx_2: Tensor,
+#                geometry: Geometry, orbs: OrbitalInfo, **kwargs) -> Tensor:
+#         r"""Compute atomic interaction blocks using SK-integral tables.
+#
+#         Returns the atomic blocks associated with the atoms in ``atomic_idx_1``
+#         interacting with those in ``atomic_idx_2`` splines and Slater-Koster
+#         transformations. This is the base method used in DFTB calculations.
+#         Note that The № of interaction blocks returned will be equal to the
+#         length of the two index lists; i.e. *not* one for every combination.
+#
+#         Arguments:
+#             atomic_idx_1: Indices of the 1'st atom associated with each
+#                 desired interaction block.
+#             atomic_idx_2: Indices of the 2'nd atom associated with each
+#                 desired interaction block.
+#             geometry: The systems to which the atomic indices relate.
+#             orbs: Orbital information associated with said systems.
+#
+#         Returns:
+#             blocks: Requested atomic interaction sub-blocks.
+#
+#         """
+#         # Get the atomic numbers of the atoms
+#         zs = geometry.atomic_numbers
+#         zs_1 = zs[*bT2(atomic_idx_1)]
+#         zs_2 = zs[*bT2(atomic_idx_2)]
+#
+#         # Ensure all interactions are between identical species pairs.
+#         if len(zs_1.unique()) != 1:
+#             raise ValueError('Atoms in atomic_idx_1 must be the same species')
+#
+#         if len(zs_2.unique()) != 1:
+#             raise ValueError('Atoms in atomic_idx_2 must be the same species')
+#
+#         # Atomic numbers of the species in list 1 and 2
+#         z_1, z_2 = zs_1[0], zs_2[0]
+#
+#         # C-N and N-C are the same interaction: choice has been made to have
+#         # only one set of splines for each species pair. Thus, the two lists
+#         # may need to be swapped.
+#         if z_1 > z_2:
+#             atomic_idx_1, atomic_idx_2 = atomic_idx_2, atomic_idx_1
+#             z_1, z_2 = z_2, z_1
+#             flip = True
+#         else:
+#             flip = False
+#
+#         # Construct the tensor into which results are to be placed
+#         n_rows, n_cols = orbs.n_orbs_on_species(torch.stack((z_1, z_2)))
+#         blks = torch.zeros(len(atomic_idx_1), n_rows, n_cols, dtype=self.dtype,
+#                            device=self.device)
+#
+#         # Identify which are on-site blocks and which are off-site
+#         on_site = self._partition_blocks(atomic_idx_1, atomic_idx_2)
+#         mask_shell = torch.zeros_like(self.on_sites[int(z_1)]).bool()
+#         mask_shell[:(torch.arange(len(orbs.shell_dict[int(z_1)]))
+#                      * 2 + 1).sum()] = True
+#
+#         # Construct the on-site blocks (if any are present)
+#         if any(on_site):
+#             if not self.is_local_onsite:
+#                 blks[on_site] = torch.diag(self.on_sites[int(z_1)][mask_shell])
+#             elif self.is_local_onsite:
+#                 blks[on_site] = torch.diag_embed(
+#                     self.on_sites[int(z_1)][mask_shell], dim1=-2, dim2=-1)
+#
+#             # Interactions between images need to be considered for on-site
+#             # blocks with pbc.
+#             if geometry.periodicity is not None:
+#                 _on_site = self._pe_blocks(
+#                     atomic_idx_1[on_site], atomic_idx_2[on_site],
+#                     geometry, orbs, geometry.periodicity, onsite=True)
+#                 blks[on_site] = blks[on_site] + _on_site
+#
+#         if any(~on_site):  # Then the off-site blocks
+#             if geometry.periodicity is None:
+#                 blks[~on_site] = self._off_site_blocks(
+#                     atomic_idx_1[~on_site], atomic_idx_2[~on_site],
+#                     geometry, orbs)
+#             else:
+#                 blks[~on_site] = self._pe_blocks(
+#                     atomic_idx_1[~on_site], atomic_idx_2[~on_site],
+#                     geometry, orbs, geometry.periodicity)
+#
+#         if flip:  # If the atoms were switched, then a transpose is required.
+#             blks = blks.transpose(-1, -2)
+#
+#         return blks
+#
+#     @classmethod
+#     def from_database(
+#             cls, path: str, species: List[int],
+#             target: Literal['hamiltonian', 'overlap'],
+#             interpolation: str = 'polynomial',
+#             requires_grad: bool = False,
+#             dtype: Optional[torch.dtype] = None,
+#             device: Optional[torch.device] = None) -> 'SkFeed':
+#         r"""Instantiate instance from an HDF5 database of Slater-Koster files.
+#
+#         Instantiate a `SkFeed` instance for the specified elements using
+#         integral tables contained within a Slater-Koster HDF5 database.
+#
+#         Arguments:
+#             path: Path to the HDF5 file from which integrals should be taken.
+#             species: Integrals will only be loaded for the requested species.
+#             target: Specifies which integrals should be loaded options are
+#                 "hamiltonian" and "overlap".
+#             interpolation: Define interpolation type.
+#             device: Device on which the feed object and its contents resides.
+#             dtype: dtype used by feed object.
+#
+#         Returns:
+#             sk_feed: A `SkFeed` instance with the requested integrals.
+#
+#         Notes:
+#             This method will not instantiate `SkFeed` instances directly
+#             from human readable skf files, or a directory thereof. Thus, any
+#             such files must first be converted into their binary equivalent.
+#             This reduces overhead & file format error instabilities. The code
+#             block provide below shows how this can be done:
+#
+#             >>> from tbmalt.io.skf import Skf
+#             >>> Zs = ['H', 'C', 'Au', 'S']
+#             >>> for file in [f'{i}-{j}.skf' for i in Zs for j in Zs]:
+#             >>>     Skf.read(file).write('my_skf.hdf5')
+#
+#         Examples:
+#             >>> from tbmalt import OrbitalInfo, Geometry
+#             >>> from tbmalt.physics.dftb.feeds import SkFeed
+#             >>> from tbmalt.io.skf import Skf
+#             >>> from ase.build import molecule
+#             >>> import urllib
+#             >>> import tarfile
+#             >>> from os.path import join
+#             >>> import torch
+#             >>> torch.set_default_dtype(torch.float64)
+#
+#             # Link to the auorg-1-1 parameter set
+#             >>> link = \
+#             'https://dftb.org/fileadmin/DFTB/public/slako/auorg/auorg-1-1.tar.xz'
+#
+#             # Preparation of sk file
+#             >>> elements = ['H', 'C', 'O', 'Au', 'S']
+#             >>> tmpdir = './'
+#             >>> urllib.request.urlretrieve(
+#                     link, path := join(tmpdir, 'auorg-1-1.tar.xz'))
+#             >>> with tarfile.open(path) as tar:
+#                     tar.extractall(tmpdir)
+#             >>> skf_files = [join(tmpdir, 'auorg-1-1', f'{i}-{j}.skf')
+#                              for i in elements for j in elements]
+#             >>> for skf_file in skf_files:
+#                     Skf.read(skf_file).write(path := join(tmpdir,
+#                                                           'auorg.hdf5'))
+#
+#             # Preparation of system to calculate
+#             >>> geo = Geometry.from_ase_atoms(molecule('H2'))
+#             >>> orbs = OrbitalInfo(geo.atomic_numbers,
+#                                      shell_dict={1: [0]})
+#
+#             # Definition of feeds
+#             >>> h_feed = SkFeed.from_database(path, [1], 'hamiltonian')
+#             >>> s_feed = SkFeed.from_database(path, [1], 'overlap')
+#
+#             # Matrix elements
+#             >>> H = h_feed.matrix(geo, orbs)
+#             >>> S = s_feed.matrix(geo, orbs)
+#             >>> print(H)
+#             tensor([[-0.2386, -0.3211],
+#                     [-0.3211, -0.2386]])
+#             >>> print(S)
+#             tensor([[1.0000, 0.6433],
+#                     [0.6433, 1.0000]])
+#
+#         """
+#         # As C-H & C-H interactions are the same only one needs to be loaded.
+#         # Thus, only off-site interactions where z₁≤z₂ are generated. However,
+#         # integrals are split over the two Slater-Koster tables, thus both must
+#         # be loaded.
+#
+#         # There must be something better than this
+#         def clip(x, y):
+#             # Removes leading zeros from the sk data which may cause errors
+#             # when fitting the CubicSpline.
+#             start = torch.nonzero(y.sum(0), as_tuple=True)[0][0]
+#             return x[start:], y[:, start:].transpose(0, 1)
+#
+#         # Ensure a valid target is selected
+#         if target not in ['hamiltonian', 'overlap']:
+#             ValueError('Invalid target selected; '
+#                        'options are "hamiltonian" or "overlap"')
+#
+#         on_sites, off_sites = {}, {}
+#         interpolation = interp_dict[interpolation]
+#         params = {'extrapolate': False} if interpolation is CubicSpline else {}
+#
+#         # The species list must be sorted to ensure that the lowest atomic
+#         # number comes first in the species pair.
+#         for pair in combinations_with_replacement(sorted(species), 2):
+#
+#             skf = Skf.read(path, pair, device=device) if interpolation is not BicubInterp else\
+#                 VCRSkf.read(path, pair, device=device)
+#
+#             # Loop over the off-site interactions & construct the splines.
+#             for key, value in skf.__getattribute__(target).items():
+#                 # Why is BicubInterp used here but not in the next block?
+#                 if interpolation is BicubInterp:
+#                     off_sites[pair + key] = interpolation(
+#                         skf.compression_radii.to(device), value.transpose(0, 1), skf.grid, **params)
+#                 else:
+#                     # Clip the knot values to remove leading zeros
+#                     grid, value = clip(skf.grid, value)
+#                     # Convert the y-knot values to a `torch.nn.Parameter` and
+#                     # enable gradient tracking as required.
+#                     value = Parameter(value, requires_grad=requires_grad)
+#                     off_sites[pair + key] = interpolation(grid, value, **params)
+#
+#             # The X-Y.skf file may not contain all information. Thus, some info
+#             # must be loaded from its Y-X counterpart.
+#             if pair[0] != pair[1]:
+#                 skf_2 = Skf.read(path, tuple(reversed(pair)))
+#                 for key, value in skf_2.__getattribute__(target).items():
+#                     if key[0] < key[1]:
+#                         if interpolation is BicubInterp:
+#                             off_sites[pair + key] = interpolation(
+#                                 skf.compression_radii.to(device), value.transpose(0, 1), skf.grid, **params)
+#                         else:
+#                             # Clip the knot values to remove leading zeros
+#                             grid, value = clip(skf.grid, value)
+#                             # Convert the y-knot values to a `torch.nn.Parameter` and
+#                             # enable gradient tracking as required.
+#                             value = Parameter(value, requires_grad=requires_grad)
+#                             off_sites[pair + (*reversed(key),)] = interpolation(grid, value, **params)
+#
+#             else:  # Construct the onsite interactions
+#                 # Repeated so there's 1 value per orbital not just per shell.
+#                 on_sites_vals = skf.on_sites.repeat_interleave(
+#                     torch.arange(len(skf.on_sites), device=device) * 2 + 1)
+#
+#                 if target == 'overlap':  # use an identify matrix for S
+#                     on_sites_vals = torch.ones_like(on_sites_vals, dtype=dtype, device=device)
+#
+#                 on_sites[pair[0]] = on_sites_vals
+#
+#         return cls(on_sites, off_sites, interpolation, dtype, device)
+#
+#     @property
+#     def vcr(self):
+#         """The various compression radii."""
+#         return self._vcr
+#
+#     @vcr.setter
+#     def vcr(self, value):
+#         self._vcr = value
+#
+#     def local_onsite(self, value: Tensor):
+#         """Only when is_local_onsite is True local_onsite will return Tensor."""
+#         return value if self.is_local_onsite else None
+#
+#     def __str__(self):
+#         elements = ', '.join([
+#             chemical_symbols[i]for i in sorted(self.on_sites.keys())])
+#         return f'{self.__class__.__name__}({elements})'
+#
+#     def __repr__(self):
+#         return str(self)

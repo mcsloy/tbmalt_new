@@ -8,7 +8,7 @@ from tbmalt import Geometry, OrbitalInfo
 from tbmalt.physics.dftb import Dftb1, Dftb2
 from tbmalt.physics.dftb.feeds import SkFeed, SkfOccupationFeed, HubbardFeed
 from tbmalt.common.batch import pack
-
+from tbmalt.common.maths.interpolation import CubicSpline
 
 torch.set_default_dtype(torch.float64)
 
@@ -19,7 +19,7 @@ torch.set_default_dtype(torch.float64)
 #   - add more tests for DFTB2 calculations, right now only atomic charges
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def shell_resolved_feeds(device, skf_file):
     species = [1, 6, 8, 79]
     h_feed = SkFeed.from_database(skf_file, species, 'hamiltonian', device=device)
@@ -29,7 +29,7 @@ def shell_resolved_feeds(device, skf_file):
     return h_feed, s_feed, o_feed
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def shell_resolved_feeds_scc(device, skf_file):
     species = [1, 6, 8]
     h_feed = SkFeed.from_database(skf_file, species, 'hamiltonian', device=device)
@@ -39,13 +39,14 @@ def shell_resolved_feeds_scc(device, skf_file):
 
     return h_feed, s_feed, o_feed, u_feed
 
-@pytest.fixture
+
+@pytest.fixture(scope="session")
 def shell_resolved_feeds_scc_spline(device, skf_file):
     species = [1, 6, 8]
     h_feed = SkFeed.from_database(skf_file, species, 'hamiltonian',
-                                  interpolation='spline', device=device)
+                                  interpolation=CubicSpline, device=device)
     s_feed = SkFeed.from_database(skf_file, species, 'overlap',
-                                  interpolation='spline', device=device)
+                                  interpolation=CubicSpline, device=device)
     o_feed = SkfOccupationFeed.from_database(skf_file, species, device=device)
     u_feed = HubbardFeed.from_database(skf_file, species, device=device)
 
@@ -877,6 +878,7 @@ def test_dftb2_batch_shell_resolved(device, shell_resolved_feeds_scc):
 
 
 def test_dftb2_batch_spl(device, shell_resolved_feeds_scc_spline):
+
     h_feed, s_feed, o_feed, u_feed = shell_resolved_feeds_scc_spline
 
     batches = [[H2_scc], [H2_scc, CH3O_scc, C_wire_scc],
@@ -889,3 +891,20 @@ def test_dftb2_batch_spl(device, shell_resolved_feeds_scc_spline):
         assert calculator.device == device, 'Calculator is on the wrong device'
 
         dftb2_helper(calculator, geometry, orbs, results)
+
+
+if __name__ == "__main__":
+    from tbmalt.common.maths.interpolation import CubicSpline
+    device = torch.device("cpu")
+    skf_file = "/home/ajmhpc/Projects/TBMaLT/Working/FeedUpdating/tbmalt_new/auorg.hdf5"
+    species = [1, 6, 8]
+    h_feed = SkFeed.from_database(skf_file, species, 'hamiltonian',
+                                  interpolation=CubicSpline, device=device)
+    s_feed = SkFeed.from_database(skf_file, species, 'overlap',
+                                  interpolation=CubicSpline, device=device)
+    o_feed = SkfOccupationFeed.from_database(skf_file, species, device=device)
+    u_feed = HubbardFeed.from_database(skf_file, species, device=device)
+
+    dat = (h_feed, s_feed, o_feed, u_feed)
+
+    test_dftb2_batch_spl(device, dat)
