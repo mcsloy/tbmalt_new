@@ -18,6 +18,7 @@ from torch import Tensor
 from torch.nn import Parameter, ParameterDict, ModuleDict, Module
 
 from tbmalt import Geometry, OrbitalInfo, Periodicity
+from tbmalt.structures.geometry import unique_atom_pairs, atomic_pair_indices
 from tbmalt.ml.integralfeeds import IntegralFeed
 from tbmalt.io.skf import Skf, VCRSkf
 from tbmalt.physics.dftb.slaterkoster import sub_block_rot
@@ -622,7 +623,7 @@ class SkFeed(IntegralFeed):
         self._off_sites = value
 
     def _off_site_blocks(self, atomic_idx_1: Tensor, atomic_idx_2: Tensor,
-                         geometry: Geometry, orbs: OrbitalInfo, shift_vec = None, **kwargs) -> Tensor:
+                         geometry: Geometry, orbs: OrbitalInfo, shift_vec=None, **kwargs) -> Tensor:
         """Compute atomic interaction blocks (off-site only).
 
         Constructs the off-site atomic blocks using Slater-Koster integral
@@ -1909,6 +1910,63 @@ class RepulsiveSplineFeed(Feed):
     def device(self) -> torch.device:
         """The device on which the `RepulsiveSplineFeed` object resides."""
         return list(self.spline_data.values())[0].grid.device
+
+    # def _evaluate(
+    #         self, distances: Tensor, z1: Union[Tensor, int],
+    #         z2: Union[Tensor, int]) -> Tensor:
+    #     """Calculate the repulsive energy contribution between two atoms.
+    #
+    #     Arguments:
+    #         distance: The distance between the two atoms.
+    #         atomnum1: The atomic number of the first atom.
+    #         atomnum2: The atomic number of the second atom.
+    #
+    #     returns:
+    #         Erep: The repulsive energy contribution between the two atoms.
+    #     """
+    #
+    #     spline = self.spline_data[frozenset((int(z1), int(z2)))]
+    #
+    #     results = torch.zeros_like(distances)
+    #
+    #     tail_start = spline.grid[-1]
+    #     exp_head_cutoff = spline.grid[0]
+    #
+    #     if tail_start < distances < spline.cutoff:
+    #         pass
+    #
+    #     elif exp_head_cutoff < distances < spline.cutoff:
+    #         pass
+    #     return results
+    #
+    #     # spline = self.spline_data[frozenset((int(z1), int(z2)))]
+    #     #
+    #     # tail_start = spline.grid[-1]
+    #     #
+    #     # exp_head_cutoff = spline.grid[0]
+    #     #
+    #     # if distance < spline.cutoff:
+    #     #     if distance > tail_start:
+    #     #         return self._tail(distance, tail_start, spline.tail_coef)
+    #     #     elif distance > exp_head_cutoff:
+    #     #         for ind in range(len(spline.grid)):
+    #     #             if distance < spline.grid[ind]:
+    #     #                 return self._spline(distance, spline.grid[ind-1], spline.spline_coef[ind-1])
+    #     #     else:
+    #     #         return self._exponential_head(distance, spline.exp_coef)
+    #     # return torch.tensor(0.0, dtype=self.dtype, device=self.device)
+    #
+    # def _forward_single_cluster(self, geometry: Geometry) -> Tensor:
+    #
+    #     e_repulsive = torch.tensor(0., dtype=self.dtype, device=self.device)
+    #
+    #     # Compute distances between all atom pairs
+    #     distances = geometry.distances
+    #
+    #     for pair, indices in atomic_pair_indices(geometry, ignore_self=True):
+    #         e_repulsive += self._evaluate(distances[*indices], *pair).sum()
+    #
+    #     return e_repulsive
 
     def __call__(self, geo: Geometry) -> Tensor:
         r"""Calculate the repulsive energy of a Geometry.

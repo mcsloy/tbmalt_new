@@ -5,7 +5,7 @@ This module provides the `Geometry` data structure class and its associated
 code. The `Geometry` class is intended to hold any & all data needed to fully
 describe a chemical system's structure.
 """
-from typing import Union, List, Optional, Type
+from typing import Union, List, Optional, Type, Tuple
 from operator import itemgetter
 import torch
 import numpy as np
@@ -729,7 +729,8 @@ def batch_chemical_symbols(atomic_numbers: Union[Tensor, List[Tensor]]
         return [s[m].tolist() for s, m in zip(symbols, mask)]
 
 
-def unique_atom_pairs(geometry: Geometry) -> Tensor:
+def unique_atom_pairs(
+        geometry: Geometry, return_ordered_pairs: bool = False) -> Tensor:
     """Returns a tensor specifying all unique atom pairs.
 
     This takes `Geometry` instance and identifies all atom pairs. This use
@@ -738,12 +739,226 @@ def unique_atom_pairs(geometry: Geometry) -> Tensor:
 
     Arguments:
          geometry: `Geometry` instance representing the target system.
+         return_ordered_pairs: `bool` indicating whether to consider pairs as
+            ordered. If set to `False`, pairs like (1, 2) and (2, 1) are
+            treated as equivalent and only the former is returned. If set to
+            `True`, both (2, 1) and (1, 2) will be returned as they will be
+            considered to be distinct. [DEFAULT: False]
 
     Returns:
         unique_atom_pairs: A tensor specifying all unique atom pairs.
     """
-    uan = geometry.unique_atomic_numbers()
-    n_global = len(uan)
-    return torch.stack([uan.repeat(n_global),
-                        uan.repeat_interleave(n_global)]).T
 
+    unique_atomic_numbers = geometry.unique_atomic_numbers()
+
+    if return_ordered_pairs:
+        n_global = len(unique_atomic_numbers)
+        return torch.stack([
+            unique_atomic_numbers.repeat_interleave(n_global),
+            unique_atomic_numbers.repeat(n_global)]).T
+    else:
+        return torch.combinations(unique_atomic_numbers,
+                                  with_replacement=True)
+
+
+def atomic_pair_indices(
+        geometry: Geometry, ignore_self: bool = False,
+        force_batch_index: bool = False) -> Tuple[Tensor, Tensor]:
+    """Atomic pair index generator ....
+
+    Generates all unique element-pair types & yields the corresponding indices
+    of atoms pairs that match those types.
+
+    Generates all unique element-pair types and, for each such pair, yields
+    the indices of the atoms (and possibly cells and/or batches) that
+    match that element-pair. The result is useful for enumerating all
+    pairwise interactions present in a single system or a batch of systems,
+    including possible consideration of periodic boundary conditions.
+
+    Arguments:
+        geometry: The system, or batch thereof, for which pair-wise
+            interaction indices are to be generated.
+        ignore_self: Boolean indicating whether self-interaction pairs should
+            be ignored. If enabled, any pair where both indices refer to the
+            same atom (i.e. an atom interacting with itself) is excluded.
+            This only pertains to self-interactions and not interactions
+            with copies in neighbouring images.[DEFAULT: False]
+        force_batch_index: If ``True``, forces the returned ``pair_indices``
+            to include a leading batch index dimension even for single systems.
+            By default (``False``), a batch dimension is only included if
+            ``geometry`` actually represents a batch. [DEFAULT: False]
+
+    Yields:
+        pair (Tensor): A tensor of shape `(2,)` specifying the atomic
+            numbers of the two species that define the pair. For example,
+            `(6, 8)` for a carbon-oxygen pair.
+        pair_indices (Tensor): A tensor of integer indices that identify
+            each occurrence of that ``pair`` in the system(s). The exact
+            shape and meaning of each row depends on three factors:
+            (1) whether the system is single or batched,
+            (2) whether the system is periodic, and
+            (3) whether ``force_batch_index`` is set:
+
+            - **Single, non-periodic**:
+              - `force_batch_index=False` ⇒ shape `(2, P)`
+              - `force_batch_index=True`  ⇒ shape `(3, P)`
+            - **Single, periodic**:
+              - `force_batch_index=False` ⇒ shape `(3, P)`
+              - `force_batch_index=True`  ⇒ shape `(4, P)`
+            - **Batched, non-periodic** ⇒ shape `(3, P)`
+            - **Batched, periodic** ⇒ shape `(4, P)`
+
+            In all cases, the final two rows (or columns, after transpose)
+            indicate the atomic indices of the interacting atoms. If there
+            is a batch dimension, it occupies the first row. If the system
+            is periodic, there is an additional row for the periodic cell
+            index (or indices, depending on implementation). The remaining
+            rows, if present, are the atomic indices within that batch and/or
+            cell context.
+    """
+    if geometry.is_periodic:
+        return _atomic_pair_indices_periodic(geometry, ignore_self, force_batch_index)
+    else:
+        return _atomic_pair_indices(geometry, ignore_self, force_batch_index)
+
+
+def _atomic_pair_indices(
+        geometry: Geometry, ignore_self: bool = False,
+        force_batch_index: bool = False) -> Tuple[Tensor, Tensor]:
+    """Atomic pair index generator for clusters.
+
+    Generates all unique element-pair types & yields the corresponding indices
+    of atoms pairs that match those types.
+
+    Arguments:
+        geometry: The system, or batch thereof, for which pair-wise
+            interaction indices are to be generated.
+        ignore_self: Boolean indicating whether self-interaction pairs should
+            be ignored. If enabled, pairs involving an atom interacting with
+            itself will be filtered out. Caution is advised when using this
+            flag in conjunction with periodic systems. [DEFAULT: False]
+        force_batch_index: `bool` indicating whether to force the presence of
+            batch indices in the returned ``pair_indices`` tensor. By default,
+            batch indices are only present when the system in question is a
+            batch. However, it is sometimes useful to include a batch index
+            for single systems to aid in writing batch agnostic code.
+            [DEFAULT: False]
+
+    Yields:
+        pair: Atomic-number pair tensor of shape (2, ) specifying which
+            species pair the indices correspond to.
+        pair_indices: Atomic index array identifying the atoms associated with
+            each interaction of the corresponding ``pair`` type. For a single
+            system this will be of shape 2xP, which, for each pair "P",
+            provides the atomic indices of the two atoms. For batches, this
+            will be 3xP where the first dimension specifies which system in
+            the batch the atoms belong to.
+    """
+
+    # Construct the atom resolved atomic number matrix
+    shape = geometry.atomic_numbers.shape + geometry.atomic_numbers.shape[-1:]
+
+    if force_batch_index and len(shape) == 2:
+        shape = torch.Size([1]) + shape
+
+    atomic_number_matrix = torch.stack((
+        geometry.atomic_numbers.unsqueeze(-1).expand(shape),
+        geometry.atomic_numbers.unsqueeze(-2).expand(shape)), dim=-1)
+
+    # Loop over the set of unique atomic number pairs
+    for pair in unique_atom_pairs(geometry):
+
+        # Get the atomic indices of all such atom pairs.
+        pair_indices = torch.nonzero((atomic_number_matrix == pair).all(-1))
+
+        # Skip the iteration if no such atom pairs exist.
+        if pair_indices.nelement() == 0:
+            continue
+
+        # The means by which pair indices are generated results in homo-atomic
+        # interaction pairs indices being duplicated. Thus, a filtering step
+        # is required for homo-atomic pairs.
+        if pair[0] == pair[1]:
+
+            # Also purge self-interactions if instructed to do so.
+            if ignore_self:
+                pair_indices = pair_indices[torch.where(
+                    pair_indices[..., -2].lt(pair_indices[..., -1]))]
+
+            else:
+                pair_indices = pair_indices[torch.where(
+                    pair_indices[..., -2].le(pair_indices[..., -1]))]
+
+        yield pair, pair_indices.T
+
+
+def _atomic_pair_indices_periodic(
+        geometry: Geometry, ignore_self: bool = False,
+        force_batch_index: bool = False) -> Tuple[Tensor, Tensor]:
+    """Atomic pair index generator for periodic systems.
+
+    Generates all unique element-pair types & yields the corresponding indices
+    of atoms pairs that match those types.
+
+    Arguments:
+        geometry: The system, or batch thereof, for which pair-wise
+            interaction indices are to be generated.
+        ignore_self: Boolean indicating whether self-interaction pairs should
+            be ignored. If enabled, pairs involving an atom interacting with
+            itself will be filtered out. Caution is advised when using this
+            flag in conjunction with periodic systems. [DEFAULT: False]
+        force_batch_index: `bool` indicating whether to force the presence of
+            batch indices in the returned ``pair_indices`` tensor. By default,
+            batch indices are only present when the system in question is a
+            batch. However, it is sometimes useful to include a batch index
+            for single systems to aid in writing batch agnostic code.
+            [DEFAULT: False]
+
+    Yields:
+        pair: Atomic-number pair tensor of shape (2, ) specifying which
+            species pair the indices correspond to.
+        pair_indices: Atomic index array identifying the atoms associated with
+            each interaction of the corresponding ``pair`` type. For a single
+            system this will be of shape 3xP, which, for each pair "P",
+            provides the cell index and the atomic indices of the two atoms.
+            For batches, this will be 4xP where the first dimension specifies
+            which system in the batch the atoms belong to.
+    """
+    # Although the number of cells associated with each system is likely to
+    # differ the largest is taken to make indexing easier. Cells that are
+    # outside the "valid" range will get culled as they will be marked as
+    # out of range by the `neighbours` mask.
+    n_cells = geometry.periodicity.n_cells.max()
+
+    origin_cell_idx = int((n_cells - 1) / 2)
+    cell_idxs = torch.arange(n_cells)
+
+    is_batch = force_batch_index or geometry.atomic_numbers.ndim == 2
+    neighbours = geometry.periodicity.neighbour
+
+    # Expand the neighbours tensor if forcing the present of batch indices
+    if force_batch_index:
+        neighbours = neighbours.view(-1, *neighbours.shape[-3:])
+
+    # Loop over the non-periodic indices and expand them to account for
+    # periodicity. The `ignore_self` flag is not passed on otherwise indices
+    # for atoms interacting with copies of themselves would be missing.
+    for pair, idx in _atomic_pair_indices(geometry, False, force_batch_index):
+        # Expand the pair indices to include interactions with all periodic cells
+        idx_p = torch.vstack([
+            cell_idxs.repeat(idx.shape[-1]),
+            torch.repeat_interleave(idx, n_cells, -1)])
+
+        # Adjust the indices so the batch index comes at the start as expected
+        if is_batch:
+            idx_p = idx_p[[1, 0, 2, 3]]
+
+        # Remove on-site interactions is requested
+        if ignore_self and pair[0] == pair[1]:
+            idx_p = idx_p.T[*torch.where(
+                idx_p[-3].ne(origin_cell_idx).logical_or(idx_p[-1].ne(idx_p[-2])))].T
+
+        # Filter the interaction list so that only those in range remain
+        idx_p = idx_p.T[neighbours[*idx_p]].T
+
+        yield pair, idx_p
