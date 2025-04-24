@@ -653,8 +653,6 @@ class SkFeed(IntegralFeed):
         if shift_vec is not None:
             dist_vec = dist_vec + shift_vec
         dist = torch.linalg.norm(dist_vec, dim=-1)
-        if shift_vec is not None:
-            dist_vec = dist_vec + shift_vec
         u_vec = (dist_vec.T / dist).T
 
         # Work out the width of each sub-block then use it to get the row and
@@ -1841,9 +1839,7 @@ class HubbardFeed(Feed):
             device: Device on which to place tensors. [DEFAULT=None]
             dtype: dtype to be used for floating point tensors. [DEFAULT=None]
             requires_grad: boolean indicating if gradient tracking should be
-                enabled for the Hubbard-Us. If enabled, the relevant
-                dictionaries and tensors will be converted into `ParameterDict`
-                and `Parameter` instances respectively. [DEFAULT=False]
+                enabled for the Hubbard-Us. [DEFAULT=False]
 
         Returns:
             hubbard_u_feed: A `HubbardFeed` instance containing the

@@ -761,10 +761,82 @@ def unique_atom_pairs(
                                   with_replacement=True)
 
 
+def atomic_pair_distances(
+        geometry: Geometry, ignore_self: bool = False,
+        force_batch_index: bool = False) -> Tuple[Tensor, Tensor]:
+    """Atomic pair distance generator.
+
+    Generates all unique element-pair types and, for each such pair, yields the
+    indices of the matching atom pairs along with the distance between each
+    pair. Useful for enumerating all pairwise interactions present in a system
+    or batch thereof, including possible consideration of periodic boundary
+    conditions.
+
+    Arguments:
+        geometry: The system, or batch thereof, for which pair-wise
+            interaction indices are to be generated.
+        ignore_self: Boolean indicating whether self-interaction pairs should
+            be ignored. If enabled, any pair where both indices refer to the
+            same atom (i.e. an atom interacting with itself) is excluded.
+            This only pertains to self-interactions and not interactions
+            with copies in neighbouring images.[DEFAULT: False]
+        force_batch_index: If ``True``, forces the returned ``pair_indices``
+            to include a leading batch index dimension even for single systems.
+            By default (``False``), a batch dimension is only included if
+            ``geometry`` actually represents a batch. [DEFAULT: False]
+
+    Yields:
+        pair: A tensor of shape `(2,)` specifying the atomic numbers of the two
+            species that define the pair. For example, `(6, 8)` for a carbon -
+            oxygen pair.
+        pair_indices: A tensor of integer indices that identify each occurrence
+            of that ``pair`` in the system(s). The exact shape and meaning of
+            each row depends on three factors:
+            (1) whether the system is single or batched,
+            (2) whether the system is periodic, and
+            (3) whether ``force_batch_index`` is set:
+
+            - **Single, non-periodic**:
+              - `force_batch_index=False` ⇒ shape `(2, P)`
+              - `force_batch_index=True`  ⇒ shape `(3, P)`
+            - **Single, periodic**:
+              - `force_batch_index=False` ⇒ shape `(3, P)`
+              - `force_batch_index=True`  ⇒ shape `(4, P)`
+            - **Batched, non-periodic** ⇒ shape `(3, P)`
+            - **Batched, periodic** ⇒ shape `(4, P)`
+
+            In all cases, the final two rows (or columns, after transpose)
+            indicate the atomic indices of the interacting atoms. If there
+            is a batch dimension, it occupies the first row. If the system
+            is periodic, there is an additional row for the periodic cell
+            index (or indices, depending on implementation). The remaining
+            rows, if present, are the atomic indices within that batch and/or
+            cell context.
+        distances: A tensor of distances for each indexed pair, with the same
+            “pair-count” dimension `P`. For periodic systems this will be the
+            periodic distance; otherwise the direct distance.
+    """
+
+    # Compute distances between all atom pairs
+    distances = geometry.periodicity.periodic_distances \
+        if geometry.is_periodic else geometry.distances
+
+    # Enforcing the presence of a batch dimension if requested
+    if force_batch_index and geometry.atomic_numbers.ndim == 1:
+        distances = distances.view(
+            -1, *distances.shape[-3 if geometry.is_periodic else -2:])
+
+    # Wrap the `atomic_pair_indices` generator to extend its returns to
+    # include distances.
+    for pair, idx in atomic_pair_indices(
+            geometry, ignore_self, force_batch_index):
+        yield pair, idx, distances[*idx]
+
+
 def atomic_pair_indices(
         geometry: Geometry, ignore_self: bool = False,
         force_batch_index: bool = False) -> Tuple[Tensor, Tensor]:
-    """Atomic pair index generator ....
+    """Atomic pair index generator
 
     Generates all unique element-pair types & yields the corresponding indices
     of atoms pairs that match those types.
@@ -789,12 +861,12 @@ def atomic_pair_indices(
             ``geometry`` actually represents a batch. [DEFAULT: False]
 
     Yields:
-        pair (Tensor): A tensor of shape `(2,)` specifying the atomic
-            numbers of the two species that define the pair. For example,
-            `(6, 8)` for a carbon-oxygen pair.
-        pair_indices (Tensor): A tensor of integer indices that identify
-            each occurrence of that ``pair`` in the system(s). The exact
-            shape and meaning of each row depends on three factors:
+        pair: A tensor of shape `(2,)` specifying the atomic numbers of the two
+            species that define the pair. For example, `(6, 8)` for a carbon -
+            oxygen pair.
+        pair_indices: A tensor of integer indices that identify each occurrence
+            of that ``pair`` in the system(s). The exact shape and meaning of
+            each row depends on three factors:
             (1) whether the system is single or batched,
             (2) whether the system is periodic, and
             (3) whether ``force_batch_index`` is set:
